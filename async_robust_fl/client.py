@@ -1,5 +1,5 @@
 """
-client.py — AsyncFLClient and client_fn.
+client.py — AsyncFLClient and make_client_fn.
 
 Each Flower client represents one hospital.  The client:
   1. Receives the current global model weights.
@@ -7,13 +7,16 @@ Each Flower client represents one hospital.  The client:
   3. Optionally simulates adversarial, noisy, or unreliable behaviour.
   4. Returns updated weights + metadata for staleness / detection.
 
-client_fn() is the factory consumed by Flower's ClientApp.
-It reads dirichlet_alpha from context.run_config so Experiment E can
-override the partitioning without touching any other code.
+make_client_fn(dirichlet_alpha) is the public factory consumed by
+Flower's ClientApp.  It returns a closure-based client_fn so that
+Experiment E can override dirichlet_alpha without relying on
+run_simulation's run_config argument (which is not stable across
+Flower minor releases).
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Tuple
 
 import numpy as np
@@ -26,6 +29,8 @@ from config import (
     DIRICHLET_ALPHA,
     NOISY_CLIENT_IDS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncFLClient(fl.client.NumPyClient):
@@ -76,7 +81,17 @@ class AsyncFLClient(fl.client.NumPyClient):
         """
 
         # --- 1. Unreliable client: simulate dropout / network timeout ---
-        dropout_prob = float(config.get("dropout_prob", 0.0))
+        # Determine role from the ID lists passed by the strategy.
+        # client.cid is a UUID in Flower 1.8+ simulation, so we use our own
+        # partition_id (available at construction time) to check membership.
+        def _parse_ids(key: str) -> frozenset:
+            raw = str(config.get(key, ""))
+            return frozenset(int(x) for x in raw.split(",") if x.strip().isdigit())
+
+        is_malicious  = self.partition_id in _parse_ids("malicious_ids")
+        is_unreliable = self.partition_id in _parse_ids("unreliable_ids")
+
+        dropout_prob = float(config.get("dropout_prob", 0.0)) if is_unreliable else 0.0
         if dropout_prob > 0.0 and np.random.random() < dropout_prob:
             raise RuntimeError(
                 f"Hospital-{self.partition_id}: simulated dropout / network timeout."
@@ -90,7 +105,6 @@ class AsyncFLClient(fl.client.NumPyClient):
         updated_params = get_weights(self.net)
 
         # --- 4. Adversarial injection ---
-        is_malicious = bool(config.get("is_malicious", False))
         attack_type  = str(config.get("attack_type", "none"))
 
         if is_malicious:
@@ -107,7 +121,11 @@ class AsyncFLClient(fl.client.NumPyClient):
             elif attack_type == "sign_flip":
                 updated_params = [-p for p in updated_params]
 
-            # Unknown attack type → honest update (safe fallback, avoid silent error)
+            else:
+                logger.warning(
+                    "Hospital-%d: unrecognised attack_type=%r — using honest update.",
+                    self.partition_id, attack_type,
+                )
 
         # --- 5. Simulated async arrival delay (metadata carried in metrics) ---
         simulated_delay = float(
@@ -144,31 +162,44 @@ class AsyncFLClient(fl.client.NumPyClient):
 # Flower ClientApp factory
 # ---------------------------------------------------------------------------
 
-def client_fn(context) -> fl.client.Client:
-    """Create and return an AsyncFLClient for the given hospital (context).
+def make_client_fn(dirichlet_alpha: float = DIRICHLET_ALPHA):
+    """Return a Flower-compatible client_fn with ``dirichlet_alpha`` baked in.
 
-    Reads `dirichlet_alpha` from context.run_config so that Experiment E
-    can override partitioning without modifying this function.
+    Using a closure avoids relying on ``run_simulation``'s ``run_config``
+    keyword argument, whose availability varies across Flower minor releases.
+    Each call to ``make_client_fn`` produces an independent factory so that
+    different experiments (e.g. Exp E IID vs non-IID) do not share state.
 
-    Hospital taxonomy (defined in config.py):
-        {0,1}    → Malicious   (strategy injects attack via config)
-        {4,5}    → Noisy       (data partitioned with 30% label noise)
-        {6,7}    → Unreliable  (dropout_prob=0.4 per round)
-        {2,3,8,9}→ Honest
+    Hospital taxonomy (defined in config.py)::
+        {0, 1}    → Malicious   (strategy injects attack via FitIns config)
+        {4, 5}    → Noisy       (30 % label noise applied to training data)
+        {6, 7}    → Unreliable  (dropout_prob = 0.4 per round)
+        {2,3,8,9} → Honest
+
+    Args:
+        dirichlet_alpha: Heterogeneity parameter forwarded to
+                         :func:`data.load_data`.  0.5 = non-IID (default),
+                         1000.0 = near-IID (Experiment E).
+
+    Returns:
+        A ``client_fn(context) → fl.client.Client`` callable ready to be
+        passed to ``flwr.client.ClientApp``.
     """
-    partition_id = int(context.node_config["partition-id"])
+    _alpha = float(dirichlet_alpha)   # snapshot at factory creation time
 
-    # Allow alpha override for Experiment E (IID vs non-IID isolation)
-    alpha = float(context.run_config.get("dirichlet_alpha", DIRICHLET_ALPHA))
+    def client_fn(context) -> fl.client.Client:
+        partition_id = int(context.node_config["partition-id"])
 
-    # Noisy hospitals receive mislabelled training data
-    noise_rate = 0.3 if partition_id in NOISY_CLIENT_IDS else 0.0
+        # Noisy hospitals receive mislabelled training data
+        noise_rate = 0.3 if partition_id in NOISY_CLIENT_IDS else 0.0
 
-    net = PathologyNet()
-    trainloader, testloader = load_data(
-        partition_id,
-        noise_rate      = noise_rate,
-        dirichlet_alpha = alpha,
-    )
+        net = PathologyNet()
+        trainloader, testloader = load_data(
+            partition_id,
+            noise_rate      = noise_rate,
+            dirichlet_alpha = _alpha,
+        )
 
-    return AsyncFLClient(partition_id, net, trainloader, testloader).to_client()
+        return AsyncFLClient(partition_id, net, trainloader, testloader).to_client()
+
+    return client_fn

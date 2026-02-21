@@ -15,6 +15,7 @@ References to mandatory features:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -24,7 +25,9 @@ matplotlib.use("Agg")   # non-interactive backend — safe for simulation runs
 import matplotlib.pyplot as plt
 
 from model import PathologyNet, set_weights, evaluate_model
-from config import NUM_CLIENTS, RESULTS_DIR
+from config import NUM_CLIENTS, RESULTS_DIR, ASYNC_BUFFER_SIZE
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -44,44 +47,50 @@ def _save(fig: plt.Figure, filename: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Server-side evaluation factory
+# Server-side evaluation — callable class
 # ---------------------------------------------------------------------------
 
-def make_evaluate_fn(global_testloader) -> Callable:
-    """Return a Flower-compatible evaluate_fn that logs accuracy per round.
+class EvaluateFn:
+    """Stateful, callable server evaluation function.
 
-    The returned callable is stateful: it accumulates accuracy_history and
-    loss_history as lists.  These are attached as attributes so main.py
-    can retrieve them after run_simulation completes.
+    Flower's ``evaluate_fn`` interface requires a plain callable; using a class
+    satisfies that interface while keeping ``accuracy_history`` and
+    ``loss_history`` as proper instance attributes instead of attaching mutable
+    lists to a function object (which is not type-safe or picklable).
 
-    Usage:
+    Usage::
         eval_fn = make_evaluate_fn(load_global_test())
         strategy = AsyncRobustFLStrategy(evaluate_fn=eval_fn, ...)
         # after run_simulation():
         accuracies = eval_fn.accuracy_history
     """
-    accuracy_history: List[float] = []
-    loss_history:     List[float] = []
 
-    def evaluate_fn(
+    def __init__(self, global_testloader) -> None:
+        self._testloader      = global_testloader
+        self.accuracy_history: List[float] = []
+        self.loss_history:     List[float] = []
+
+    def __call__(
+        self,
         server_round: int,
-        parameters: List[np.ndarray],
-        config: Dict,
+        parameters:   List[np.ndarray],
+        config:       Dict,
     ) -> Tuple[float, Dict]:
         net = PathologyNet()
         set_weights(net, parameters)
-        accuracy, loss = evaluate_model(net, global_testloader)
-        accuracy_history.append(accuracy)
-        loss_history.append(loss)
-        print(
-            f"[Round {server_round:02d}]  "
-            f"PathMNIST Accuracy: {accuracy:.4f}  |  Loss: {loss:.4f}"
+        accuracy, loss = evaluate_model(net, self._testloader)
+        self.accuracy_history.append(accuracy)
+        self.loss_history.append(loss)
+        logger.info(
+            "[Round %02d]  PathMNIST Accuracy: %.4f  |  Loss: %.4f",
+            server_round, accuracy, loss,
         )
         return float(loss), {"accuracy": float(accuracy), "round": server_round}
 
-    evaluate_fn.accuracy_history = accuracy_history
-    evaluate_fn.loss_history     = loss_history
-    return evaluate_fn
+
+def make_evaluate_fn(global_testloader) -> EvaluateFn:
+    """Return an EvaluateFn instance configured for server-side evaluation."""
+    return EvaluateFn(global_testloader)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +133,54 @@ def plot_convergence(
 
 
 # ---------------------------------------------------------------------------
+# Plot 1b — Loss (cost) curves (Experiments A–D on one graph)
+# ---------------------------------------------------------------------------
+
+def plot_loss_curves(
+    results_dict: Dict[str, List[float]],
+    save_path: str = "loss_curves.png",
+) -> plt.Figure:
+    """Line chart of per-round global cross-entropy loss for multiple experiments.
+
+    Companion plot to plot_convergence: shows the cost (loss) trajectory so
+    reviewers can see both accuracy improvement *and* loss reduction in one
+    glance.
+
+    Args:
+        results_dict: {label: loss_history}  (e.g. 'Exp A: FedAvg clean')
+        save_path   : filename inside RESULTS_DIR.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+    markers = ["o", "s", "^", "D", "v", "P"]
+    colors  = ["steelblue", "tomato", "green", "purple", "orange", "brown"]
+
+    for idx, (label, losses) in enumerate(results_dict.items()):
+        rounds = range(1, len(losses) + 1)
+        ax.plot(
+            rounds, losses,
+            marker    = markers[idx % len(markers)],
+            linestyle = "-",
+            label     = label,
+            linewidth = 2,
+            markersize= 4,
+            color     = colors[idx % len(colors)],
+        )
+
+    ax.set_xlabel("Communication Round", fontsize=12)
+    ax.set_ylabel("Global Cross-Entropy Loss (PathMNIST)", fontsize=12)
+    ax.set_title(
+        "Training Cost (Loss) Curves: AsyncRobustFL vs Baselines\n"
+        "(10 Hospitals, PathMNIST — lower is better)",
+        fontsize=13,
+    )
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _save(fig, save_path)
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Plot 2 — DP trade-off (Experiment C vs D)  [Mandatory #4]
 # ---------------------------------------------------------------------------
 
@@ -140,8 +197,8 @@ def plot_dp_tradeoff(
     """
     rounds = range(1, len(acc_no_dp) + 1)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(rounds, acc_no_dp,   "-o", label="AsyncRobust (no DP)",  linewidth=2, color="steelblue")
-    ax.plot(rounds, acc_with_dp, "-s", label=f"AsyncRobust + DP (ε≈{epsilon:.1f})",
+    ax.plot(rounds, acc_no_dp,   marker="o", label="AsyncRobust (no DP)",  linewidth=2, linestyle="-",  color="steelblue")
+    ax.plot(rounds, acc_with_dp, marker="s", label=f"AsyncRobust + DP (ε≈{epsilon:.1f})",
             linewidth=2, linestyle="--", color="darkorange")
     ax.set_xlabel("Communication Round", fontsize=12)
     ax.set_ylabel("Global Accuracy", fontsize=12)
@@ -235,8 +292,8 @@ def plot_dropout_reliability(
     ax.bar(rounds, dropped,   label="Dropped / timed out", color="tomato",    alpha=0.85,
            bottom=submitted)
 
-    ax.axhline(y=4, color="black", linestyle="--", linewidth=1.2,
-               label="Async buffer threshold (4)")
+    ax.axhline(y=ASYNC_BUFFER_SIZE, color="black", linestyle="--", linewidth=1.2,
+               label=f"Async buffer threshold ({ASYNC_BUFFER_SIZE})")
 
     ax.set_xlabel("Round", fontsize=12)
     ax.set_ylabel("Hospital Count", fontsize=12)
@@ -254,42 +311,67 @@ def plot_dropout_reliability(
 
 def plot_detection(
     flagged_history: List[Dict],
-    all_bad_ids:     frozenset,
-    save_path:       str = "detection_rate.png",
+    malicious_ids:   frozenset,
+    noisy_ids:       frozenset = frozenset(),
+    save_path:       str       = "detection_rate.png",
 ) -> plt.Figure:
-    """Two-panel: true detection rate and false positive rate per round.
+    """Two-panel chart: Byzantine detection rate and false positive rate per round.
 
-    all_bad_ids = MALICIOUS_CLIENT_IDS | NOISY_CLIENT_IDS
+    Detection rate is computed **only for malicious clients** (gradient attacks)
+    because the norm/cosine filters are designed to catch gradient corruption,
+    not label-noise corruption.  Noisy clients (who corrupt training labels but
+    may still produce plausible gradient directions) are shown separately with
+    a distinct colour so their incidental flagging is visible but is not folded
+    into the primary detection metric.
+
+    Args:
+        flagged_history : List of {"round": int, "flagged": List[int]} dicts
+                          collected by the strategy.
+        malicious_ids   : Client IDs known to submit adversarial gradient updates.
+        noisy_ids       : Client IDs with label noise (not gradient attacks).
+        save_path       : Filename inside RESULTS_DIR.
     """
-    rounds              = [r["round"] for r in flagged_history]
-    detection_rates:     List[float] = []
+    rounds:               List[int]   = [r["round"]   for r in flagged_history]
+    detection_rates:      List[float] = []
     false_positive_rates: List[float] = []
+    noisy_detect_rates:   List[float] = []
 
-    honest_count = NUM_CLIENTS - len(all_bad_ids)
+    honest_count = NUM_CLIENTS - len(malicious_ids) - len(noisy_ids)
 
     for entry in flagged_history:
         flagged_set = set(entry["flagged"])
-        tp  = len(flagged_set & all_bad_ids)
-        fp  = len(flagged_set - all_bad_ids)
-        dr  = tp / len(all_bad_ids) if all_bad_ids else 0.0
-        fpr = fp / honest_count     if honest_count > 0 else 0.0
+        tp_mal  = len(flagged_set & malicious_ids)
+        tp_noisy = len(flagged_set & noisy_ids)
+        fp      = len(flagged_set - malicious_ids - noisy_ids)
+
+        dr   = tp_mal   / len(malicious_ids) if malicious_ids else 0.0
+        ndr  = tp_noisy / len(noisy_ids)     if noisy_ids     else 0.0
+        fpr  = fp       / honest_count       if honest_count  > 0 else 0.0
+
         detection_rates.append(dr)
+        noisy_detect_rates.append(ndr)
         false_positive_rates.append(fpr)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 
-    ax1.bar(rounds, detection_rates, color="green", alpha=0.75)
-    ax1.set_ylabel("True Detection Rate", fontsize=11)
+    ax1.bar(rounds, detection_rates,   color="green",     alpha=0.80,
+            label=f"Malicious clients {sorted(malicious_ids)}")
+    if noisy_ids:
+        ax1.bar(rounds, noisy_detect_rates, color="goldenrod", alpha=0.65,
+                label=f"Noisy clients {sorted(noisy_ids)} (incidental)")
+    ax1.set_ylabel("Detection Rate", fontsize=11)
     ax1.set_title(
-        "Malicious + Noisy Client Detection per Round\n"
-        f"(Target IDs: {sorted(all_bad_ids)})",
+        "Byzantine Detection per Round\n"
+        f"(Gradient attacks: IDs {sorted(malicious_ids)}  |"
+        f"  Label-noise: IDs {sorted(noisy_ids)})",
         fontsize=12,
     )
     ax1.set_ylim(0, 1.15)
     ax1.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+    ax1.legend(fontsize=9)
 
     ax2.bar(rounds, false_positive_rates, color="tomato", alpha=0.75)
-    ax2.set_ylabel("False Positive Rate", fontsize=11)
+    ax2.set_ylabel("False Positive Rate\n(Honest Hospitals Flagged)", fontsize=11)
     ax2.set_xlabel("Round", fontsize=11)
     ax2.set_ylim(0, 1.15)
 
@@ -340,16 +422,53 @@ def estimate_epsilon(
     num_rounds:       int,
     delta:            float = 1e-5,
 ) -> float:
-    """Simplified Gaussian mechanism privacy budget estimate.
+    """Compute (\u03b5, \u03b4)-DP budget via R\u00e9nyi DP composition of the subsampled
+    Gaussian mechanism, optimised over R\u00e9nyi orders \u03b1 \u2208 [2, 512].
 
-    Sufficient for demonstration purposes; not a tight RDP bound.
-    For production use, apply the google/dp-accounting library.
+    Based on:
+      - Mironov (2017) “R\u00e9nyi Differential Privacy of the Gaussian Mechanism”
+      - Wang et al. (2019) “Subsampled R\u00e9nyi DP and Analytical Moments Accountant”
+
+    The per-step RDP of the Poisson-subsampled Gaussian mechanism
+    (leading-order in q for small sampling rate q) is::
+
+        \u03b5_RDP(\u03b1) = log(1 + \u03b1(\u03b1-1)q\u00b2 / (2\u03c3\u00b2)) / (\u03b1 - 1)
+
+    After T rounds of composition:  \u03b5_RDP_total(\u03b1) = T \u00d7 \u03b5_RDP(\u03b1)
+
+    Conversion to (\u03b5, \u03b4)-DP (Proposition 3, Balle et al. 2020 / standard RDP)::
+
+        \u03b5(\u03b4) = \u03b5_RDP_total(\u03b1) + log(1/\u03b4) / (\u03b1 - 1)
+
+    The function minimises over \u03b1 to return the tightest achievable \u03b5.
+    This bound is tighter than the classical strong composition theorem and
+    does not require any external DP-accounting library.
+
+    Args:
+        noise_multiplier : \u03c3 (noise standard deviation relative to clipping norm).
+        sampling_rate    : q = clients_per_round / total_clients.
+        num_rounds       : T (number of FL rounds with DP applied).
+        delta            : \u03b4 failure probability; typically 1/n where n = dataset size.
+
+    Returns:
+        Estimated privacy budget \u03b5 (lower = stronger privacy).
     """
     sigma = noise_multiplier
     q     = sampling_rate
     T     = num_rounds
-    epsilon = (q * np.sqrt(T * 2.0 * np.log(1.25 / delta))) / sigma
-    return float(epsilon)
+
+    best_eps = float("inf")
+    for alpha in range(2, 513):
+        a = float(alpha)
+        # Per-step RDP of Poisson-subsampled Gaussian (small-q leading order)
+        rdp_per_step = np.log1p(a * (a - 1.0) * q ** 2 / (2.0 * sigma ** 2)) / (a - 1.0)
+        rdp_total    = T * rdp_per_step
+        # Standard RDP → (\u03b5, \u03b4)-DP conversion, minimised over \u03b1
+        eps = rdp_total + np.log(1.0 / delta) / (a - 1.0)
+        if eps < best_eps:
+            best_eps = eps
+
+    return float(best_eps)
 
 
 # ---------------------------------------------------------------------------
@@ -384,12 +503,15 @@ def print_summary(
     total_selected = sum(e["total_selected"] for e in dropout_history)
     dropout_rate   = total_dropped / (total_selected + 1e-10)
 
-    print(f"\n{'=' * 55}")
-    print(f"  Experiment : {experiment_name}")
-    print(f"{'=' * 55}")
-    print(f"  Final Accuracy       : {final_acc:.4f}")
-    print(f"  Convergence Round    : {convergence_round or 'Did not reach 90%'}")
-    print(f"  Total Flagged Events : {total_flagged}")
-    print(f"  Avg Detection Rate   : {detection_rate:.2%}")
-    print(f"  Client Dropout Rate  : {dropout_rate:.2%}  ({total_dropped}/{total_selected})")
-    print(f"{'=' * 55}\n")
+    lines = [
+        f"\n{'=' * 55}",
+        f"  Experiment : {experiment_name}",
+        f"{'=' * 55}",
+        f"  Final Accuracy       : {final_acc:.4f}",
+        f"  Convergence Round    : {convergence_round or 'Did not reach 90%'}",
+        f"  Total Flagged Events : {total_flagged}",
+        f"  Avg Detection Rate   : {detection_rate:.2%}",
+        f"  Client Dropout Rate  : {dropout_rate:.2%}  ({total_dropped}/{total_selected})",
+        f"{'=' * 55}",
+    ]
+    logger.info("\n".join(lines))

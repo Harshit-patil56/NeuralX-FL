@@ -15,6 +15,7 @@ Design decisions:
 
 from __future__ import annotations
 
+import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -35,48 +36,67 @@ from config import (
 _TRANSFORM = Compose([ToTensor(), Normalize(PATHMNIST_MEAN, PATHMNIST_STD)])
 
 # ---------------------------------------------------------------------------
-# In-memory cache: { "train": (images, labels), "test": (images, labels) }
-# Downloading happens at most once per Python process.
+# In-memory cache: { "train": (images_np, labels_np) }  — numpy arrays only.
+# Images are memory-mapped from the npz file so the OS shares physical pages
+# across all Ray actor processes instead of each process allocating ~847 MB.
+# Tensors are built per-client AFTER subsetting (≈10 MB, not 847 MB).
 # ---------------------------------------------------------------------------
-_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
-def _load_split(split: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """Download (if needed) and cache PathMNIST for `split` ∈ {'train','test','val'}.
+def _ensure_downloaded(data_dir: str) -> str:
+    """Download pathmnist.npz once and return its path."""
+    npz_path = os.path.join(data_dir, "pathmnist.npz")
+    if not os.path.exists(npz_path):
+        try:
+            from medmnist import PathMNIST
+        except ImportError as exc:
+            raise ImportError(
+                "medmnist is not installed. Run: pip install medmnist>=3.0.0"
+            ) from exc
+        os.makedirs(data_dir, exist_ok=True)
+        # Trigger download for all splits at once
+        PathMNIST(split="train", download=True, root=data_dir)
+    return npz_path
+
+
+def _load_split(split: str) -> tuple[np.ndarray, np.ndarray]:
+    """Memory-map PathMNIST for `split` ∈ {'train', 'val', 'test'}.
+
+    Returns **numpy arrays** (not tensors) so callers can subset cheaply
+    before allocating GPU/CPU tensor memory.
 
     Returns:
-        images : Tensor[N, 3, 28, 28]
-        labels : Tensor[N]            (dtype=torch.long)
+        images : ndarray[N, 28, 28, 3]  uint8
+        labels : ndarray[N]             int64
     """
     if split in _CACHE:
         return _CACHE[split]
 
-    try:
-        from medmnist import PathMNIST
-    except ImportError as exc:
-        raise ImportError(
-            "medmnist is not installed. Run: pip install medmnist>=3.0.0"
-        ) from exc
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    npz_path = _ensure_downloaded(data_dir)
 
-    dataset = PathMNIST(
-        split=split,
-        transform=_TRANSFORM,
-        download=True,
-        root="./data",
-    )
+    # mmap_mode="r" → OS memory-maps the file; physical pages are shared across
+    # all Ray worker processes — no per-process 847 MB allocation.
+    data = np.load(npz_path, mmap_mode="r")
+    imgs = data[f"{split}_images"]   # shape (N, 28, 28, 3)  uint8
+    lbls = data[f"{split}_labels"]   # shape (N, 1)          int64
 
-    imgs, lbls = [], []
-    for img, lbl in dataset:
-        imgs.append(img)
-        # medmnist returns labels as 1-element arrays or scalars
-        lbls.append(int(lbl.item() if hasattr(lbl, "item") else lbl[0]))
-
-    result: tuple[torch.Tensor, torch.Tensor] = (
-        torch.stack(imgs),
-        torch.tensor(lbls, dtype=torch.long),
-    )
+    result: tuple[np.ndarray, np.ndarray] = (imgs, lbls.squeeze(1))
     _CACHE[split] = result
     return result
+
+
+def _imgs_to_tensor(imgs_np: np.ndarray) -> torch.Tensor:
+    """Apply normalisation transform to an (N, 28, 28, 3) uint8 numpy array.
+
+    ``ToTensor`` accepts H×W×C uint8 ndarrays and converts them to
+    C×H×W float tensors in [0, 1] before ``Normalize`` is applied.
+    A contiguous copy is forced first so random-index slices from a
+    memory-mapped array don't cause issues with strided access.
+    """
+    imgs_np = np.ascontiguousarray(imgs_np)   # ensure C-contiguous
+    return torch.stack([_TRANSFORM(img) for img in imgs_np])
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +207,24 @@ def load_data(
     Data never leaves this function unpartitioned — each hospital only
     receives its own slice.
     """
-    train_imgs, train_labels = _load_split("train")
-    test_imgs,  test_labels  = _load_split("test")
+    train_imgs_np, train_labels_np = _load_split("train")
+    test_imgs_np,  test_labels_np  = _load_split("test")
 
-    train_idx = _dirichlet_split(train_labels, num_clients, dirichlet_alpha, seed=42)
-    test_idx  = _dirichlet_split(test_labels,  num_clients, dirichlet_alpha, seed=43)
+    # Build label tensors for Dirichlet partitioning (small: ~0.7 MB each)
+    train_labels_t = torch.tensor(np.array(train_labels_np), dtype=torch.long)
+    test_labels_t  = torch.tensor(np.array(test_labels_np),  dtype=torch.long)
 
-    t_imgs   = train_imgs[train_idx[partition_id]]
-    t_labels = train_labels[train_idx[partition_id]]
-    v_imgs   = test_imgs[test_idx[partition_id]]
-    v_labels = test_labels[test_idx[partition_id]]
+    train_idx = _dirichlet_split(train_labels_t, num_clients, dirichlet_alpha, seed=42)
+    test_idx  = _dirichlet_split(test_labels_t,  num_clients, dirichlet_alpha, seed=43)
+
+    t_idx = train_idx[partition_id]
+    v_idx = test_idx[partition_id]
+
+    # Convert ONLY this client's slice to tensors (≈10 MB, not 847 MB)
+    t_imgs   = _imgs_to_tensor(train_imgs_np[t_idx])
+    t_labels = train_labels_t[t_idx]
+    v_imgs   = _imgs_to_tensor(test_imgs_np[v_idx])
+    v_labels = test_labels_t[v_idx]
 
     if noise_rate > 0.0:
         t_labels = add_label_noise(t_labels, noise_rate, seed=partition_id)
@@ -224,7 +252,9 @@ def load_global_test() -> DataLoader:
     This is NEVER shown to any individual hospital — it is only used by the
     server's evaluate_fn to measure the quality of the global model.
     """
-    test_imgs, test_labels = _load_split("test")
+    test_imgs_np, test_labels_np = _load_split("test")
+    test_imgs   = _imgs_to_tensor(test_imgs_np)   # ~67 MB — fine for server
+    test_labels = torch.tensor(np.array(test_labels_np), dtype=torch.long)
     return DataLoader(
         TensorDataset(test_imgs, test_labels),
         batch_size=64,
