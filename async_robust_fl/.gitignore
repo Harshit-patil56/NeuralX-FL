@@ -1,0 +1,72 @@
+# ── Hackathon-specific ignores ──────────────────────────────────────────────
+context.txt
+report.txt
+
+# Tests
+tests/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# ── Data & model weights ─────────────────────────────────────────────────────
+data/
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# ── Results / outputs ────────────────────────────────────────────────────────
+# results/ is intentionally tracked — PNG plots display in README on GitHub
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── pytest / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.coveragerc
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Ray / Flower simulation temp files ───────────────────────────────────────
+/tmp/
+ray_results/
