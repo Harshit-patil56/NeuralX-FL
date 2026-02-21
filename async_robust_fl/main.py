@@ -22,11 +22,22 @@ Experiment map:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
 # Ensure the package root is on the path when running from the workspace root
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ---------------------------------------------------------------------------
+# Logging — configured before any package import that might create loggers
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -34,7 +45,7 @@ import torch
 import flwr as fl
 from flwr.client import ClientApp
 from flwr.common import ndarrays_to_parameters
-from flwr.server import ServerApp, ServerConfig
+from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.server.strategy import DifferentialPrivacyClientSideAdaptiveClipping
 from flwr.client.mod import adaptiveclipping_mod
 from flwr.simulation import run_simulation
@@ -55,14 +66,16 @@ from config import (
     TRIM_FRACTION,
     NORM_THRESHOLD,
     COSINE_THRESHOLD,
+    RESULTS_DIR,
 )
 from model import PathologyNet, get_weights
 from data import load_global_test
-from client import client_fn
+from client import make_client_fn
 from strategy import AsyncRobustFLStrategy
 from evaluation import (
     make_evaluate_fn,
     plot_convergence,
+    plot_loss_curves,
     plot_dp_tradeoff,
     plot_attack_impact,
     plot_dropout_reliability,
@@ -82,6 +95,7 @@ def run_one_experiment(
     method:          str   = "trimmed_mean",
     use_dp:          bool  = False,
     use_attack:      bool  = True,
+    use_detection:   bool  = True,
     dirichlet_alpha: float = DIRICHLET_ALPHA,
     num_rounds:      int   = NUM_ROUNDS,
     label:           str   = "",
@@ -92,6 +106,8 @@ def run_one_experiment(
         method          : Aggregation algorithm ('fedavg' | 'trimmed_mean' | 'median').
         use_dp          : Wrap strategy with DP adaptive clipping if True.
         use_attack      : Activate malicious + noisy clients if True.
+        use_detection   : Enable norm + cosine Byzantine detection filters.
+                          Set False for Exp B to expose raw FedAvg vulnerability.
         dirichlet_alpha : Data heterogeneity (0.5=non-IID, 1000=IID).
         num_rounds      : Number of FL rounds.
         label           : Human-readable experiment name for logging.
@@ -103,10 +119,9 @@ def run_one_experiment(
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
-    print(f"\n{'#' * 60}")
-    print(f"  Running: {label or method}")
-    print(f"  method={method}  dp={use_dp}  attack={use_attack}  alpha={dirichlet_alpha}")
-    print(f"{'#' * 60}\n")
+    logger.info("Starting: %s", label or method)
+    logger.info("method=%s  dp=%s  attack=%s  detection=%s  alpha=%s",
+                method, use_dp, use_attack, use_detection, dirichlet_alpha)
 
     mal_ids   = MALICIOUS_CLIENT_IDS   if use_attack else frozenset()
     noisy_ids = NOISY_CLIENT_IDS       if use_attack else frozenset()
@@ -127,6 +142,8 @@ def run_one_experiment(
         malicious_client_ids  = mal_ids,
         noisy_client_ids      = noisy_ids,
         unreliable_client_ids = UNRELIABLE_CLIENT_IDS,
+        use_detection         = use_detection,
+        # num_byzantine is derived automatically from len(mal_ids) inside the strategy
     )
 
     base_strategy = strategy   # keep reference for telemetry
@@ -139,13 +156,22 @@ def run_one_experiment(
             initial_clipping_norm = DP_CLIPPING_NORM,
         )
 
-    server_app = ServerApp(
-        config   = ServerConfig(num_rounds=num_rounds),
-        strategy = strategy,
-    )
+    # Use the new server_fn / ServerAppComponents pattern (avoid deprecation
+    # warning from passing strategy/config directly to the ServerApp constructor)
+    _strategy    = strategy          # captured by closure
+    _num_rounds  = num_rounds
 
+    def server_fn(context) -> ServerAppComponents:
+        return ServerAppComponents(
+            strategy = _strategy,
+            config   = ServerConfig(num_rounds=_num_rounds),
+        )
+
+    server_app = ServerApp(server_fn=server_fn)
+
+    # make_client_fn captures dirichlet_alpha via closure — no run_config needed
     mods       = [adaptiveclipping_mod] if use_dp else []
-    client_app = ClientApp(client_fn=client_fn, mods=mods)
+    client_app = ClientApp(client_fn=make_client_fn(dirichlet_alpha), mods=mods)
 
     run_simulation(
         server_app     = server_app,
@@ -158,11 +184,11 @@ def run_one_experiment(
                 "num_gpus": 0.5 if torch.cuda.is_available() else 0.0,
             }
         },
-        run_config = {"dirichlet_alpha": dirichlet_alpha},
     )
 
     return (
         list(eval_fn.accuracy_history),
+        list(eval_fn.loss_history),
         list(base_strategy.flagged_history),
         list(base_strategy.dropout_history),
     )
@@ -173,12 +199,12 @@ def run_one_experiment(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Experiment A — FedAvg, no attack (clean non-IID baseline)
     # ------------------------------------------------------------------
-    acc_A, flagged_A, dropout_A = run_one_experiment(
+    acc_A, loss_A, flagged_A, dropout_A = run_one_experiment(
         method      = "fedavg",
         use_dp      = False,
         use_attack  = False,
@@ -192,12 +218,15 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Experiment B — FedAvg under 20% malicious + noisy attack
+    # use_detection=False: filters are OFF so FedAvg has no defence —
+    # this is what makes Exp B show the raw attack damage.
     # ------------------------------------------------------------------
-    acc_B, flagged_B, dropout_B = run_one_experiment(
-        method      = "fedavg",
-        use_dp      = False,
-        use_attack  = True,
-        label       = "Exp B: FedAvg, under attack",
+    acc_B, loss_B, flagged_B, dropout_B = run_one_experiment(
+        method         = "fedavg",
+        use_dp         = False,
+        use_attack     = True,
+        use_detection  = False,
+        label          = "Exp B: FedAvg, under attack",
     )
     print_summary(
         "Exp B: FedAvg attacked",
@@ -208,7 +237,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Experiment C — AsyncRobust (TrimmedMean + detection), 20% attack
     # ------------------------------------------------------------------
-    acc_C, flagged_C, dropout_C = run_one_experiment(
+    acc_C, loss_C, flagged_C, dropout_C = run_one_experiment(
         method      = "trimmed_mean",
         use_dp      = False,
         use_attack  = True,
@@ -223,7 +252,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Experiment D — AsyncRobust + DP (full system)
     # ------------------------------------------------------------------
-    acc_D, flagged_D, dropout_D = run_one_experiment(
+    acc_D, loss_D, flagged_D, dropout_D = run_one_experiment(
         method      = "trimmed_mean",
         use_dp      = True,
         use_attack  = True,
@@ -237,10 +266,19 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Experiment E — Heterogeneity isolation
-    #   E-nonIID : same as Exp C (reuse acc_C)
-    #   E-IID    : identical settings, alpha=1000.0
+    #   E-nonIID : identical settings to Exp C but run independently
+    #              (ensures controlled comparison: ONLY alpha differs)
+    #   E-IID    : same settings, alpha=1000.0
     # ------------------------------------------------------------------
-    acc_E_iid, _, _ = run_one_experiment(
+    acc_E_noniid, _, _, _ = run_one_experiment(
+        method          = "trimmed_mean",
+        use_dp          = False,
+        use_attack      = True,
+        dirichlet_alpha = DIRICHLET_ALPHA,
+        label           = "Exp E: AsyncRobust, non-IID (alpha=0.5)",
+    )
+
+    acc_E_iid, _, _, _ = run_one_experiment(
         method          = "trimmed_mean",
         use_dp          = False,
         use_attack      = True,
@@ -257,9 +295,13 @@ def main() -> None:
         num_rounds       = NUM_ROUNDS,
         delta            = DP_DELTA,
     )
-    print(f"\nPrivacy budget (Exp D): ε ≈ {epsilon:.2f}, δ = {DP_DELTA}")
-    print(f"Interpretation: ε={epsilon:.2f} means an attacker cannot distinguish")
-    print(f"individual training samples with probability better than e^{epsilon:.2f} ≈ {np.exp(epsilon):.1f}×.\n")
+    logger.info(
+        "Privacy budget (Exp D): \u03b5 \u2248 %.4f, \u03b4 = %s  \n"
+        "Interpretation: the log-odds ratio by which any adversary can distinguish "
+        "a participating record from a non-participating record is bounded by \u03b5. "
+        "(Lower \u03b5 = stronger privacy. Computed via R\u00e9nyi DP accountant.)",
+        epsilon, DP_DELTA,
+    )
 
     # ------------------------------------------------------------------
     # All 6 plots
@@ -280,23 +322,36 @@ def main() -> None:
 
     plot_dropout_reliability(dropout_C, save_path="dropout_reliability.png")
 
-    all_bad_ids = MALICIOUS_CLIENT_IDS | NOISY_CLIENT_IDS
-    plot_detection(flagged_C, all_bad_ids, save_path="detection_rate.png")
+    plot_detection(
+        flagged_C,
+        malicious_ids = MALICIOUS_CLIENT_IDS,
+        noisy_ids     = NOISY_CLIENT_IDS,
+        save_path     = "detection_rate.png",
+    )
 
-    plot_heterogeneity(acc_C, acc_E_iid, save_path="heterogeneity.png")
+    plot_heterogeneity(acc_E_noniid, acc_E_iid, save_path="heterogeneity.png")
+
+    plot_loss_curves(
+        {
+            "Exp A: FedAvg clean":       loss_A,
+            "Exp B: FedAvg attacked":    loss_B,
+            "Exp C: AsyncRobust":        loss_C,
+            "Exp D: AsyncRobust + DP":   loss_D,
+        },
+        save_path = "loss_curves.png",
+    )
 
     # ------------------------------------------------------------------
     # Attack metrics table
     # ------------------------------------------------------------------
     metrics = compute_attack_metrics(acc_A, acc_B, acc_C)
-    print("\nAttack / Defence Metrics")
-    print("-" * 40)
+    logger.info("\nAttack / Defence Metrics")
+    logger.info("-" * 40)
     for k, v in metrics.items():
-        print(f"  {k:<28}: {v:.4f}")
-    print()
+        logger.info("  %-28s: %.4f", k, v)
 
-    print("All plots saved to ./results/")
-    print("Done.")
+    logger.info("All plots saved to %s", RESULTS_DIR)
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

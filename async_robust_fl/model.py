@@ -19,9 +19,15 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 # ---------------------------------------------------------------------------
-# Device — resolved once at import time; rest of code never calls .cuda() directly
+# Device — GPU only; raises immediately if no CUDA-capable device is found
 # ---------------------------------------------------------------------------
-DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "No CUDA-capable GPU found. "
+        "Install a CUDA-enabled PyTorch build: "
+        "pip install torch --extra-index-url https://download.pytorch.org/whl/cu124"
+    )
+DEVICE: torch.device = torch.device("cuda")
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +152,13 @@ def evaluate_model(
             labels = labels.to(device)
 
             outputs = net(images)
-            loss_sum += criterion(outputs, labels).item()
+            # Accumulate sum of per-sample losses (batch_size-weighted) so
+            # the final average is unbiased for unequal-sized last batches.
+            loss_sum += criterion(outputs, labels).item() * labels.size(0)
             _, predicted = torch.max(outputs, dim=1)
             total   += labels.size(0)
             correct += (predicted == labels).sum().item()
 
     accuracy = correct / total if total > 0 else 0.0
-    avg_loss = loss_sum / len(testloader) if len(testloader) > 0 else 0.0
+    avg_loss = loss_sum / max(total, 1)   # true per-sample mean loss
     return accuracy, avg_loss

@@ -5,6 +5,8 @@ All tuneable constants live here. No magic numbers anywhere else.
 To change any experiment parameter, edit ONLY this file.
 """
 
+import os   # used only for RESULTS_DIR absolute path
+
 # ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
@@ -47,7 +49,8 @@ UNRELIABLE_CLIENT_IDS: frozenset = frozenset({6, 7})   # 20% — random dropout
 # Attack simulation
 # ---------------------------------------------------------------------------
 ATTACK_TYPE: str     = "scaling"   # "scaling" | "random" | "sign_flip"
-ATTACK_SCALE: float  = 10.0        # Multiplier for scaling attack
+ATTACK_SCALE: float  = 50.0        # Multiplier for scaling attack — large enough
+                                    # that FedAvg without filtering is visibly hurt
 NOISE_RATE: float    = 0.3         # Fraction of labels flipped for noisy clients
 DROPOUT_PROB: float  = 0.4         # Probability a unreliable client drops each round
 DELAY_SCALE: float   = 2.0         # Exponential distribution scale for simulated delay
@@ -70,4 +73,6 @@ DP_DELTA: float              = 1e-5
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-RESULTS_DIR: str = "results"    # All PNGs + summary text written here
+# Absolute path so results are always written next to this file regardless
+# of the working directory from which main.py is invoked.
+RESULTS_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")

@@ -82,6 +82,8 @@ class AsyncRobustFLStrategy(Strategy):
         malicious_client_ids: Optional[frozenset] = None,
         noisy_client_ids: Optional[frozenset] = None,
         unreliable_client_ids: Optional[frozenset] = None,
+        num_byzantine: Optional[int] = None,
+        use_detection: bool = True,
     ) -> None:
         self.current_parameters     = initial_parameters
         self.num_clients_per_round  = num_clients_per_round
@@ -94,6 +96,15 @@ class AsyncRobustFLStrategy(Strategy):
         self.malicious_client_ids   = malicious_client_ids  or frozenset()
         self.noisy_client_ids       = noisy_client_ids      or frozenset()
         self.unreliable_client_ids  = unreliable_client_ids or frozenset()
+        # Derive num_byzantine from the known malicious client count so that
+        # Krum's neighbourhood size stays in sync with config automatically.
+        self.num_byzantine = (
+            num_byzantine if num_byzantine is not None
+            else len(self.malicious_client_ids)
+        )
+        # When False the norm + cosine detection filters are skipped entirely.
+        # Set to False for Exp B to expose raw FedAvg vulnerability to attacks.
+        self.use_detection = use_detection
 
         # ---- Telemetry (persisted for evaluation.py) ----
         self.round_metrics:   List[Dict]  = []
@@ -130,30 +141,36 @@ class AsyncRobustFLStrategy(Strategy):
         # Local epochs: short warm-up, then longer for stable rounds
         local_epochs = LOCAL_EPOCHS_WARMUP if server_round <= 3 else LOCAL_EPOCHS_MAIN
 
-        fit_configurations: List[Tuple[ClientProxy, FitIns]] = []
-        for client in clients:
-            cid = int(client.cid)
-            is_malicious  = cid in self.malicious_client_ids
-            is_noisy      = cid in self.noisy_client_ids
-            is_unreliable = cid in self.unreliable_client_ids
+        # NOTE: in Flower 1.8+ simulation, client.cid is a large UUID integer,
+        # NOT the partition-id (0..num_clients-1).  We therefore pass the role
+        # ID sets as comma-separated strings so each client can self-identify
+        # using its own partition_id (available from context.node_config).
+        malicious_csv  = ",".join(sorted(str(i) for i in self.malicious_client_ids))
+        noisy_csv      = ",".join(sorted(str(i) for i in self.noisy_client_ids))
+        unreliable_csv = ",".join(sorted(str(i) for i in self.unreliable_client_ids))
 
-            config: Dict[str, Scalar] = {
-                "local_epochs":  local_epochs,
-                "current_round": server_round,
-                "model_version": self.global_version,   # for staleness
-                "delay_scale":   DELAY_SCALE,
-                # --- Adversarial behaviour ---
-                "is_malicious":  is_malicious,
-                "attack_type":   ATTACK_TYPE if is_malicious else "none",
-                "attack_scale":  ATTACK_SCALE,
-                # --- Data quality ---
-                "is_noisy":      is_noisy,
-                "noise_rate":    NOISE_RATE if is_noisy else 0.0,
-                # --- Network reliability ---
-                "dropout_prob":  DROPOUT_PROB if is_unreliable else 0.0,
-            }
-            fit_configurations.append((client, FitIns(parameters, config)))
+        # One shared config is sent to every sampled client; each client
+        # determines its own role by checking its partition_id against the lists.
+        shared_config: Dict[str, Scalar] = {
+            "local_epochs":   local_epochs,
+            "current_round":  server_round,
+            "model_version":  self.global_version,
+            "delay_scale":    DELAY_SCALE,
+            # Role lists (client self-identifies)
+            "malicious_ids":  malicious_csv,
+            "noisy_ids":      noisy_csv,
+            "unreliable_ids": unreliable_csv,
+            # Attack parameters (client uses only if it is malicious)
+            "attack_type":    ATTACK_TYPE,
+            "attack_scale":   ATTACK_SCALE,
+            # Noise / dropout parameters (client uses only if applicable)
+            "noise_rate":     NOISE_RATE,
+            "dropout_prob":   DROPOUT_PROB,
+        }
 
+        fit_configurations: List[Tuple[ClientProxy, FitIns]] = [
+            (client, FitIns(parameters, shared_config)) for client in clients
+        ]
         return fit_configurations
 
     # ------------------------------------------------------------------
@@ -189,19 +206,26 @@ class AsyncRobustFLStrategy(Strategy):
             staleness       = self.global_version - client_ver
             staleness_weight = 1.0 / (1.0 + max(staleness, 0))
 
+            # Use the partition_id echoed back by the client (0..num_clients-1)
+            # rather than proxy.cid (UUID) so that flagged IDs match config sets.
+            client_id = int(res.metrics.get("client_id", -1))
+
             all_updates.append({
                 "params":          parameters_to_ndarrays(res.parameters),
                 "num_examples":    res.num_examples,
                 "staleness_weight": staleness_weight,
-                "client_id":       int(proxy.cid),
+                "client_id":       client_id,
                 "is_malicious":    bool(res.metrics.get("is_malicious", False)),
                 "simulated_delay": float(res.metrics.get("simulated_delay", 0.0)),
             })
 
         # STEP 2 — Apply detection filters on ALL results BEFORE async selection
-        all_updates, norm_flagged   = filter_by_norm(all_updates, self.norm_threshold)
-        all_updates, cosine_flagged = filter_by_cosine(all_updates, self.cosine_threshold)
-        all_flagged = norm_flagged + cosine_flagged
+        if self.use_detection:
+            all_updates, norm_flagged   = filter_by_norm(all_updates, self.norm_threshold)
+            all_updates, cosine_flagged = filter_by_cosine(all_updates, self.cosine_threshold)
+            all_flagged = norm_flagged + cosine_flagged
+        else:
+            all_flagged = []
 
         self.flagged_history.append({
             "round":   server_round,
@@ -224,9 +248,10 @@ class AsyncRobustFLStrategy(Strategy):
         weights = [u["staleness_weight"] * u["num_examples"] for u in async_updates]
         aggregated = aggregate_robust(
             [u["params"] for u in async_updates],
-            method     = self.aggregation_method,
-            weights    = weights,
+            method        = self.aggregation_method,
+            weights       = weights,
             trim_fraction = self.trim_fraction,
+            num_byzantine = self.num_byzantine,
         )
 
         self.current_parameters = ndarrays_to_parameters(aggregated)
