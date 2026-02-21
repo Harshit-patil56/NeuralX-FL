@@ -1,0 +1,10 @@
+# Async Robust FL — dependencies
+# Install: pip install -r requirements.txt
+
+flwr[simulation]>=1.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+medmnist>=3.0.0          # PathMNIST dataset (colon pathology, 28x28 RGB, 9-class)
+numpy>=1.24.0
+matplotlib>=3.7.0
+scipy>=1.10.0
