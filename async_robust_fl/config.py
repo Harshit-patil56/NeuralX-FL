@@ -88,17 +88,17 @@ GROUP_COSINE_THRESHOLD: float   = 0.5
 # Set USE_REAL_NETWORK = False → standard Ray simulation (default).
 # Everything else (strategy, detection, trust scoring) is identical.
 
-USE_REAL_NETWORK: bool = False
+USE_REAL_NETWORK: bool = True
 
 # Your PC listens on this address (server side)
-SERVER_BIND: str = "0.0.0.0:8080"
+SERVER_BIND: str = "0.0.0.0:9092"
 
 # Friends pass this address via --server-address when running run_client.py.
 # With ngrok the address changes every session — no need to edit this file.
-# After starting server.py, run:  ngrok tcp 8080
+# After starting server.py, run:  ngrok tcp 9092
 # ngrok will print something like:  tcp://0.tcp.ngrok.io:12345
 # Give that string (without tcp://) to your friends.
-SERVER_HOST: str = "NGROK_ADDRESS_GOES_HERE"  # fallback only — use --server-address
+SERVER_HOST: str = "100.73.144.110"  # fallback only — use --server-address
 
 # Real mode has only 2 real client laptops (your 2 friends)
 REAL_NUM_CLIENTS: int       = 2

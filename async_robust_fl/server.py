@@ -25,7 +25,7 @@ What this does:
 
 Wireshark proof:
   - On a friend's laptop: open Wireshark → capture on the network interface.
-  - Filter: tcp.port == 8080
+  - Filter: tcp.port == 9092
   - You will see gRPC frames containing float arrays (model weights).
   - You will NOT see any image data, patient IDs, or raw pixels.
   - This proves federated learning — data never leaves the client machine.
@@ -36,6 +36,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import warnings
+
+# Suppress Flower start_server deprecation warning — it still works in 1.8
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="flwr")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -126,7 +130,30 @@ def main() -> None:
     )
 
     logger.info("Training complete.")
+    logger.info("")
+    logger.info("=== RESULTS ===")
+    logger.info("Rounds         : %d", NUM_ROUNDS)
+    logger.info("Final accuracy : %.4f", eval_fn.accuracy_history[-1] if eval_fn.accuracy_history else 0)
     logger.info("Accuracy history : %s", [round(a, 4) for a in eval_fn.accuracy_history])
+    logger.info("")
+    logger.info("=== BYZANTINE DETECTION (per round) ===")
+    for entry in strategy.flagged_history:
+        flagged = entry.get("flagged", [])
+        if flagged:
+            logger.info("  Round %2d — flagged clients: %s", entry["round"], sorted(set(flagged)))
+    total_flagged = sum(len(entry.get("flagged", [])) for entry in strategy.flagged_history)
+    logger.info("Total flagged events: %d", total_flagged)
+    logger.info("")
+    logger.info("=== DROPOUTS (per round) ===")
+    for entry in strategy.dropout_history:
+        if entry["dropped"] > 0:
+            logger.info("  Round %2d — submitted: %d  dropped: %d",
+                        entry["round"], entry["submitted"], entry["dropped"])
+    logger.info("")
+    logger.info("=== TRUST SCORES (final) ===")
+    for cid, score in sorted(strategy.trust_tracker.scores.items()):
+        status = "EXCLUDED" if score < 0.3 else "ok"
+        logger.info("  Client %d — score: %.3f  %s", cid, score, status)
 
 
 if __name__ == "__main__":
