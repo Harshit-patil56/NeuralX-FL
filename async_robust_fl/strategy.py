@@ -38,6 +38,7 @@ from flwr.server.strategy import Strategy
 
 from aggregation import aggregate_robust
 from detection import filter_by_norm, filter_by_cosine
+from trust_scoring import TrustScoreTracker
 from config import (
     CLIENTS_PER_ROUND,
     ASYNC_BUFFER_SIZE,
@@ -111,6 +112,13 @@ class AsyncRobustFLStrategy(Strategy):
         self.flagged_history: List[Dict]  = []   # [{'round': r, 'flagged': [ids]}]
         self.dropout_history: List[Dict]  = []   # [{'round': r, 'dropped': n, ...}]
 
+        # ---- Dynamic trust scoring and group formation ----
+        # trust_tracker holds per-client scores in [0, 1].  Scores decay when
+        # a client is flagged and recover on honest submissions.
+        # group_history stores the per-round cluster assignments of honest clients.
+        self.trust_tracker: TrustScoreTracker = TrustScoreTracker()
+        self.group_history: List[Dict]        = []  # [{'round': r, 'groups': {...}, ...}]
+
         # Versioned model counter: incremented once per aggregation.
         # configure_fit() sends this to every client; client returns it as
         # 'client_model_version' so the strategy can compute staleness.
@@ -148,6 +156,12 @@ class AsyncRobustFLStrategy(Strategy):
         malicious_csv  = ",".join(sorted(str(i) for i in self.malicious_client_ids))
         noisy_csv      = ",".join(sorted(str(i) for i in self.noisy_client_ids))
         unreliable_csv = ",".join(sorted(str(i) for i in self.unreliable_client_ids))
+        # Communicate the current exclusion list so clients know their status.
+        # The server will ignore their updates regardless, but this enables
+        # a client-side early-exit optimisation in future work.
+        excluded_csv   = ",".join(
+            sorted(str(i) for i in self.trust_tracker.excluded_clients())
+        )
 
         # One shared config is sent to every sampled client; each client
         # determines its own role by checking its partition_id against the lists.
@@ -160,6 +174,8 @@ class AsyncRobustFLStrategy(Strategy):
             "malicious_ids":  malicious_csv,
             "noisy_ids":      noisy_csv,
             "unreliable_ids": unreliable_csv,
+            # Trust-excluded clients (server will discard their updates)
+            "excluded_ids":   excluded_csv,
             # Attack parameters (client uses only if it is malicious)
             "attack_type":    ATTACK_TYPE,
             "attack_scale":   ATTACK_SCALE,
@@ -219,6 +235,22 @@ class AsyncRobustFLStrategy(Strategy):
                 "simulated_delay": float(res.metrics.get("simulated_delay", 0.0)),
             })
 
+        # Save submitted IDs now — before any filtering — so the trust tracker
+        # can record who attempted to contribute this round.
+        submitted_ids = [int(u["client_id"]) for u in all_updates]
+
+        # STEP 1b — Trust exclusion: drop updates from persistently distrusted
+        # clients (those whose accumulated score fell below the threshold across
+        # previous rounds).  This is a cross-round reputation filter; the
+        # per-round norm/cosine detection (STEP 2) is an independent in-round filter.
+        trust_excluded_ids = set(self.trust_tracker.excluded_clients())
+        if trust_excluded_ids:
+            all_updates = [
+                u for u in all_updates
+                if int(u["client_id"]) not in trust_excluded_ids
+            ]
+        trust_excluded_count = len(trust_excluded_ids)
+
         # STEP 2 — Apply detection filters on ALL results BEFORE async selection
         if self.use_detection:
             all_updates, norm_flagged   = filter_by_norm(all_updates, self.norm_threshold)
@@ -230,6 +262,27 @@ class AsyncRobustFLStrategy(Strategy):
         self.flagged_history.append({
             "round":   server_round,
             "flagged": all_flagged,
+        })
+
+        # STEP 2b — Update per-client trust scores based on this round's detection.
+        # Clients in submitted_ids that were NOT flagged get a small score boost.
+        # Clients that WERE flagged get an exponential decay on their score.
+        trust_snapshot = self.trust_tracker.update(
+            submitted_ids = submitted_ids,
+            flagged_ids   = all_flagged,
+            server_round  = server_round,
+        )
+
+        # STEP 2c — Cluster surviving honest clients by gradient-direction similarity.
+        # Clients whose flat gradient vectors are close (cosine >= GROUP_COSINE_THRESHOLD)
+        # land in the same sub-group, suggesting shared local data distributions.
+        # Group 0 is always the largest cluster (main federation).
+        groups = self.trust_tracker.compute_groups(all_updates, server_round)
+        self.group_history.append({
+            "round":          server_round,
+            "groups":         groups,
+            "trust_scores":   trust_snapshot,
+            "excluded_ids":   sorted(trust_excluded_ids),
         })
 
         # STEP 3 — Sort clean survivors by simulated arrival time, take buffer_size
@@ -258,12 +311,17 @@ class AsyncRobustFLStrategy(Strategy):
         self.global_version += 1   # advance versioned model counter
 
         metrics: Dict[str, Scalar] = {
-            "async_clients_used": len(async_updates),
-            "total_submitted":    len(results),
-            "clients_filtered":   len(all_flagged),
-            "clients_dropped":    len(failures),
-            "flagged_ids":        str(all_flagged),
-            "global_version":     self.global_version,
+            "async_clients_used":  len(async_updates),
+            "total_submitted":     len(results),
+            "clients_filtered":    len(all_flagged),
+            "clients_dropped":     len(failures),
+            "flagged_ids":         str(all_flagged),
+            "global_version":      self.global_version,
+            # Trust & group telemetry
+            "trust_excluded":      trust_excluded_count,
+            "num_groups":          len(groups),
+            "main_group_size":     len(groups.get(0, [])),
+            "excluded_ids":        str(sorted(trust_excluded_ids)),
         }
         self.round_metrics.append(metrics)
         return self.current_parameters, metrics

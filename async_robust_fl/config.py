@@ -64,6 +64,53 @@ NORM_THRESHOLD: float   = 3.0             # Reject if norm > 3× median norm
 COSINE_THRESHOLD: float = 0.0             # Reject if cosine similarity < 0
 
 # ---------------------------------------------------------------------------
+# Trust Scoring & Dynamic Group Formation
+# ---------------------------------------------------------------------------
+# Each client starts with full trust. Score decays when flagged by detection
+# filters and slowly recovers on honest submissions.
+
+TRUST_SCORE_INIT: float         = 1.0   # Starting trust for every client
+TRUST_DECAY: float              = 0.5   # score *= 0.5 when flagged this round
+TRUST_GROWTH: float             = 0.1   # score += 0.1 for honest submission
+TRUST_EXCLUSION_THRESHOLD: float = 0.3  # Below this → excluded from aggregation
+                                         # (two flagged rounds from 1.0 → 0.5 → 0.25
+                                         #  puts a client below threshold)
+
+# Gradient-direction similarity required for two honest clients to be placed
+# in the same sub-group (cosine ≥ 0.5 means directions within ~60° of each other)
+GROUP_COSINE_THRESHOLD: float   = 0.5
+
+# ---------------------------------------------------------------------------
+# Real Network Mode
+# ---------------------------------------------------------------------------
+# Set USE_REAL_NETWORK = True  → your PC becomes the server, friends run
+#                                run_client.py on their laptops.
+# Set USE_REAL_NETWORK = False → standard Ray simulation (default).
+# Everything else (strategy, detection, trust scoring) is identical.
+
+USE_REAL_NETWORK: bool = False
+
+# Your PC listens on this address (server side)
+SERVER_BIND: str = "0.0.0.0:8080"
+
+# Friends pass this address via --server-address when running run_client.py.
+# With ngrok the address changes every session — no need to edit this file.
+# After starting server.py, run:  ngrok tcp 8080
+# ngrok will print something like:  tcp://0.tcp.ngrok.io:12345
+# Give that string (without tcp://) to your friends.
+SERVER_HOST: str = "NGROK_ADDRESS_GOES_HERE"  # fallback only — use --server-address
+
+# Real mode has only 2 real client laptops (your 2 friends)
+REAL_NUM_CLIENTS: int       = 2
+REAL_CLIENTS_PER_ROUND: int = 2
+REAL_ASYNC_BUFFER_SIZE: int = 2
+
+# Data directory for files handed to friends.
+# SEPARATE from data/ (simulation data) — keeps simulation and real-network data apart.
+# Friends copy their pathmnist.npz here before running run_client.py.
+SHARED_DATA_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared_data")
+
+# ---------------------------------------------------------------------------
 # Differential Privacy
 # ---------------------------------------------------------------------------
 DP_NOISE_MULTIPLIER: float   = 0.1

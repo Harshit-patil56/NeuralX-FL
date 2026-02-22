@@ -1,5 +1,5 @@
 """
-demo.py — 3-round quick demonstration of NeuralX-FL for judges / mentors.
+demo.py — 3-round quick demonstration of NeuralX-FL.
 
 Runs TWO experiments in ~3 minutes on a GTX 1650:
   1. FedAvg under attack   (no defence)   → shows how attacks destroy accuracy

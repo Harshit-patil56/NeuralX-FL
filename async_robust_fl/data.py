@@ -28,6 +28,8 @@ from config import (
     DIRICHLET_ALPHA,
     PATHMNIST_MEAN,
     PATHMNIST_STD,
+    USE_REAL_NETWORK,
+    SHARED_DATA_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -73,7 +75,12 @@ def _load_split(split: str) -> tuple[np.ndarray, np.ndarray]:
     if split in _CACHE:
         return _CACHE[split]
 
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    # Real-network mode → load from shared_data/ (what you gave to friends).
+    # Simulation mode   → load from data/ (the full local copy).
+    if USE_REAL_NETWORK:
+        data_dir = SHARED_DATA_DIR
+    else:
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     npz_path = _ensure_downloaded(data_dir)
 
     # mmap_mode="r" → OS memory-maps the file; physical pages are shared across

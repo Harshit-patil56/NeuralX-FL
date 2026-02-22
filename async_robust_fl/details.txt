@@ -389,9 +389,149 @@ therefore reflect condition Exp A (clean, no attack).
 ================================================================================
 
 
-to do diffrent columns problem 
-transformation pipeline
-compute power 
-limitations 
-group creation
+--------------------------------------------------------------------------------
+11. DYNAMIC TRUST SCORING & GROUP FORMATION  (new feature — implemented)
+--------------------------------------------------------------------------------
+
+MOTIVATION
+  The original defence used per-round binary filters (norm + cosine).
+  Problem: a persistent attacker who is only caught every other round still
+  contributes poisoned updates in the rounds it is NOT flagged.
+  The filters had no cross-round memory — every round started fresh.
+
+  A second problem: the system was treating all honest hospitals as
+  interchangeable despite non-IID data distributions. Hospitals specialising
+  in the same tissue type produce more correlated gradient directions. That
+  structure was invisible in the original code.
+
+DESIGN — TRUST SCORE
+  Every hospital starts with trust score = 1.0.
+
+  Each round:
+    - Flagged by norm or cosine filter  → score = max(0.0, score × 0.5)
+    - Submitted a clean update          → score = min(1.0, score + 0.1)
+    - Did not submit (dropout)          → score unchanged
+
+  When score < 0.3 (TRUST_EXCLUSION_THRESHOLD):
+    The hospital's update is discarded before even reaching the norm/cosine
+    filters. This is a cross-round reputation layer independent of per-round
+    detection.
+
+  Score trajectory for a persistently malicious hospital:
+    Round 1 (flagged): 1.0 → 0.5
+    Round 2 (flagged): 0.5 → 0.25   ← now below 0.3, excluded from round 3+
+    Recovery (honest): 0.25 → 0.35 → 0.45 → ... (requires multiple clean rounds)
+
+  Why exponential decay, not step-function ban?
+    A single-round false positive should not permanently ban a hospital.
+    Exponential decay gives the server a graded, reversible exclusion mechanism.
+
+DESIGN — DYNAMIC GROUP FORMATION
+  After each round's detection pass, surviving honest clients are clustered
+  by the similarity of their gradient directions.
+
+  Algorithm (runs on the clean post-filter update set):
+    1. Flatten each client's full parameter update to a single 1-D vector.
+    2. L2-normalise each vector to a unit vector.
+    3. Compute pairwise cosine similarity (O(n²), n = 4–6 per round).
+    4. Build adjacency graph: edge iff cosine ≥ GROUP_COSINE_THRESHOLD (0.5).
+    5. BFS connected-component decomposition.
+    6. Sort components descending by size:
+         Group 0 = main federation (largest cluster).
+         Groups 1, 2, … = specialised sub-clusters.
+
+  Interpretation:
+    High cosine similarity between two hospitals means their local loss
+    surfaces point in a similar direction this round — they likely see
+    correlated data distributions. Under Dirichlet α=0.5 non-IID, hospitals
+    assigned similar tissue-class concentrations will cluster together.
+
+    Group 0 is used for the main global model aggregation.
+    Sub-groups are logged in group_history for post-hoc analysis.
+    Future extension: train a personalised branch model per sub-group.
+
+IMPLEMENTATION
+  Files changed:
+    config.py       — 5 new constants (TRUST_SCORE_INIT, TRUST_DECAY,
+                      TRUST_GROWTH, TRUST_EXCLUSION_THRESHOLD,
+                      GROUP_COSINE_THRESHOLD)
+    trust_scoring.py — new file, TrustScoreTracker class:
+                         .update()        — EMA trust update per round
+                         .compute_groups() — BFS clustering
+                         .excluded_clients() — IDs below threshold
+                         .is_trusted()    — single-client check
+    strategy.py     — 4 integration points in aggregate_fit():
+                         STEP 1b: trust exclusion before per-round filters
+                         STEP 2b: trust_tracker.update() after detection
+                         STEP 2c: trust_tracker.compute_groups()
+                       configure_fit(): excluded_ids CSV in shared_config
+                       New fields in round metrics:
+                         trust_excluded, num_groups, main_group_size,
+                         excluded_ids
+
+VERIFIED OUTPUT (2-round integration test, 22 Feb 2026)
+  Round 1: flagged_ids=[0]    → hospital 0 score: 1.0 → 0.5
+           excluded_ids=[]    → not yet below threshold
+           main_group_size=5, num_groups=1
+
+  Round 2: excluded_ids=[]    → still not excluded (score 0.5 ≥ 0.3)
+           main_group_size=6, num_groups=1
+  (After 2 more consecutive flaggings → score 0.25 → excluded in round 3+)
+
+  INTEGRATION OK  (exit code 0, acc after 2 rounds: 75.85%)
+
+RELATIONSHIP TO LITERATURE
+  Trust decay mechanism is architecturally similar to FLARE (Younesi et al.,
+  arXiv:2511.14715, Nov 2025), which uses multi-dimensional reputation with
+  exponential moving average. Our implementation uses a simpler 1-D score
+  grounded in direct detection filter output rather than loss-surface probing.
+
+  Group formation is related to clustered FL (Sattler et al., 2021), but our
+  approach uses raw gradient cosine similarity rather than cosine similarity
+  of loss-gradient vectors, which requires access to global test data that
+  hospitals in a real deployment would not have.
+
+
+--------------------------------------------------------------------------------
+12. KNOWN LIMITATIONS AND HONEST GAPS
+--------------------------------------------------------------------------------
+
+  L1 — Trimmed mean does nothing at n=4 clients
+       floor(0.1 × 4) = 0 → the trim step reduces to plain mean.
+       Real fix: set TRIM_FRACTION=0.25 or increase ASYNC_BUFFER_SIZE to ≥ 8.
+       Current behaviour: norm + cosine filters carry the entire defence load.
+
+  L2 — Krum is mathematically invalid at n=4, f=1
+       Blanchard (2017) requires n ≥ 2f + 3 = 5.  With n=4, neighbours=1.
+       Krum is disabled in the experiment suite (method='trimmed_mean' used).
+
+  L3 — Cosine threshold 0.0 is too loose
+       Only rejects updates pointing into the opposite half-space (cosine < 0).
+       A sideways-pointing attack (cosine = 0.1) passes unchallenged.
+       Fix: raise to 0.3–0.5 after confirming honest clients' distribution
+       on real non-IID data.
+
+  L4 — DP accuracy 38.7% is too low for clinical use
+       noise_multiplier=0.1 with clipping_norm=0.1 yields noise/signal ≈ 1.0.
+       Clinically acceptable fix: clipping_norm=1.0, noise_multiplier=0.01.
+       Trade-off: ε increases to ~6, still meaningful privacy.
+
+  L5 — Data pre-harmonisation assumed
+       The system assumes all hospitals deliver data in the same format
+       (28×28 RGB, same normalisation). Real hospitals use different scanners,
+       stain protocols, and DICOM storage formats. Harmonisation requires
+       vendor support or government FHIR mandates — outside ML scope.
+
+  L6 — Simulation only (no real hospital network)
+       Async delay is sampled from Exp(2.0), not measured from real links.
+       Flower's Ray backend serialises model weights in-process; in a real
+       deployment, each hospital would run a separate Flower client process
+       with TLS-authenticated gRPC channels.
+
+  L7 — Group formation is observational only
+       The system detects groups but does not train separate branch models
+       per group. Acting on the computed clusters (personalised aggregation)
+       is a planned but unimplemented extension.
+
+================================================================================
 
