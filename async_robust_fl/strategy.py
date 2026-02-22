@@ -142,9 +142,13 @@ class AsyncRobustFLStrategy(Strategy):
         client_manager,
     ) -> List[Tuple[ClientProxy, FitIns]]:
         """Sample hospitals and build per-client training configs."""
-        available   = client_manager.num_available()
-        sample_size = min(self.num_clients_per_round, available)
-        clients     = client_manager.sample(num_clients=sample_size)
+        # min_num_clients makes Flower block here until enough real clients
+        # have connected before starting the round.  In simulation all clients
+        # are always available so this has no effect there.
+        clients = client_manager.sample(
+            num_clients     = self.num_clients_per_round,
+            min_num_clients = self.num_clients_per_round,
+        )
 
         # Local epochs: short warm-up, then longer for stable rounds
         local_epochs = LOCAL_EPOCHS_WARMUP if server_round <= 3 else LOCAL_EPOCHS_MAIN

@@ -30,6 +30,9 @@ import argparse
 import logging
 import os
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="flwr")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
