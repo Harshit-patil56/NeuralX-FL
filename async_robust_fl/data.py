@@ -269,3 +269,25 @@ def load_global_test() -> DataLoader:
         num_workers=0,
         pin_memory=False,
     )
+
+
+def load_global_train() -> DataLoader:
+    """Full PathMNIST training set for the centralised baseline.
+
+    Used exclusively by ``centralized.py`` to train a single model on all
+    available labelled data — the theoretical upper bound for federated
+    approaches under IID conditions.
+
+    Returns:
+        DataLoader over 89,996 PathMNIST training images with ``shuffle=True``.
+    """
+    train_imgs_np, train_labels_np = _load_split("train")
+    train_imgs   = _imgs_to_tensor(train_imgs_np)
+    train_labels = torch.tensor(np.array(train_labels_np), dtype=torch.long)
+    return DataLoader(
+        TensorDataset(train_imgs, train_labels),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
