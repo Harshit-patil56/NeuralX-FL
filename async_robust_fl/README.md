@@ -1,6 +1,6 @@
 # NeuralX-FL: Asynchronous Byzantine-Robust Federated Learning for Pathology
 
-> **Hackathon Project** — End-to-end privacy-preserving FL system for multi-hospital colon pathology classification with attack simulation, detection, robust aggregation, and differential privacy.
+> **Research Project** — End-to-end privacy-preserving FL system for multi-hospital colon pathology classification with Byzantine detection, robust asynchronous aggregation, differential privacy, and full empirical evaluation including a centralised non-federated baseline.
 
 ---
 
@@ -17,7 +17,10 @@
 9. [Test Suite](#9-test-suite)
 10. [Technical Stack](#10-technical-stack)
 11. [Key Design Decisions](#11-key-design-decisions)
-12. [Output Plots](#12-output-plots)
+12. [Output Files](#12-output-files)
+13. [Experimental Methodology](#13-experimental-methodology)
+14. [Reproducibility](#14-reproducibility)
+15. [Limitations](#15-limitations)
 
 ---
 
@@ -186,21 +189,25 @@ Accuracy dropped from 81.41% (Exp C) to 38.70% (Exp D). This is a valid research
 
 ```
 async_robust_fl/
-├── config.py          # All hyperparameters and constants (single source of truth)
-├── model.py           # PathologyNet CNN (GPU-only, raises RuntimeError without CUDA)
-├── data.py            # Memory-mapped PathMNIST loading (mmap_mode="r", ~10 MB/actor)
-├── client.py          # Flower FlowerClient — local training, attack injection, dropout
-├── strategy.py        # AsyncRobustStrategy — detection, async selection, aggregation
-├── aggregation.py     # trimmed_mean, coordinate_median, krum, multi_krum
-├── detection.py       # filter_by_norm, filter_by_cosine, add_label_noise
-├── evaluation.py      # EvaluateFn class, all 7 plotting functions
-├── main.py            # Experiment runner — 6 experiments, plots, summary table
-├── requirements.txt   # Python dependencies
-├── report.txt         # Full technical report
+├── config.py                   # All hyperparameters (LEARNING_RATE, PARTICIPATION_RATES, etc.)
+├── model.py                    # PathologyNet CNN (GPU-only, raises RuntimeError without CUDA)
+├── data.py                     # Memory-mapped PathMNIST loading + load_global_train()
+├── client.py                   # Flower FlowerClient — local training, attack injection, dropout
+├── strategy.py                 # AsyncRobustStrategy — detection, async selection, aggregation
+├── aggregation.py              # trimmed_mean, coordinate_median, krum, multi_krum
+├── detection.py                # filter_by_norm, filter_by_cosine, add_label_noise
+├── evaluation.py               # EvaluateFn (with round-time tracking), 9 plotting/export functions
+├── centralized.py              # Centralised baseline: run_centralized(), export_centralized_csv()
+├── main.py                     # Experiment runner — Exp A–F + centralised + CSV/JSON export
+├── experiments.py              # Research experiments: defense comparison, sensitivity,
+│                               #   multi-seed stats, failure threshold, comm cost
+├── generate_ieee_report.py     # IEEE-style Word report generator (python-docx)
+├── requirements.txt            # Python dependencies
+├── report.txt                  # Full technical report
 ├── tests/
-│   └── test_algorithms.py   # 29 unit tests (pytest)
+│   └── test_algorithms.py      # 29 unit tests (pytest)
 ├── data/
-│   └── pathmnist.npz        # Downloaded automatically on first run
+│   └── pathmnist.npz           # Downloaded automatically on first run
 └── results/
     ├── convergence.png
     ├── loss_curves.png
@@ -208,7 +215,36 @@ async_robust_fl/
     ├── attack_impact.png
     ├── dropout_reliability.png
     ├── detection_rate.png
-    └── heterogeneity.png
+    ├── heterogeneity.png
+    ├── participation_rate.png       # Exp F — participation sweep
+    ├── centralized_vs_fl.png        # Centralised baseline overlay
+    ├── fl_metrics.csv               # Per-round FL metrics (all experiments)
+    ├── fl_metrics.json              # Same data in JSON format
+    ├── centralized_accuracy.csv     # Centralised per-epoch metrics
+    │
+    │   # ── experiments.py outputs ──────────────────────────────────────────
+    ├── defense_comparison.png       # Exp G: all defense methods vs attack
+    ├── defense_comparison.csv
+    ├── defense_comparison.json
+    ├── sensitivity_alpha.png        # Sensitivity: Dirichlet α sweep
+    ├── sensitivity_alpha.csv
+    ├── sensitivity_alpha.json
+    ├── sensitivity_byzantine.png    # Sensitivity: Byzantine % sweep
+    ├── sensitivity_byzantine.csv
+    ├── sensitivity_byzantine.json
+    ├── sensitivity_buffer.png       # Sensitivity: async buffer size sweep
+    ├── sensitivity_buffer.csv
+    ├── sensitivity_buffer.json
+    ├── multiseed_stats.png          # Multi-seed mean ± std curves
+    ├── multiseed_stats.csv
+    ├── multiseed_stats.json
+    ├── failure_threshold.png        # Robustness / failure point analysis
+    ├── failure_threshold.csv
+    ├── failure_threshold.json
+    ├── communication_cost.png       # Accuracy vs comm volume (all methods)
+    ├── rounds_to_target.png         # Rounds to 80% accuracy per method
+    ├── communication_cost.csv
+    └── communication_cost.json
 ```
 
 ---
@@ -259,15 +295,40 @@ GPU: NVIDIA GeForce GTX 1650
 
 ## 8. Running the Project
 
-### Run All Experiments
+### Run Core Experiments (A–F + Centralised baseline)
 
 ```powershell
 python main.py
 ```
 
-The first run automatically downloads PathMNIST (~16 MB) to `data/pathmnist.npz`. All 6 experiments run sequentially. Results and plots are saved to `results/`.
+The first run automatically downloads PathMNIST (~16 MB) to `data/pathmnist.npz`.
+All 6 experiments run sequentially. Results and plots are saved to `results/`.
 
 **Estimated runtime:** ~22 seconds per round on GTX 1650 (~2.5 hours total for all experiments).
+
+### Run Research Experiments
+
+```powershell
+# All research experiment groups (~12–18 hours on GTX 1650 with 3 seeds)
+python experiments.py
+
+# Run specific group(s) only
+python experiments.py --group defense
+python experiments.py --group alpha byzantine
+python experiments.py --group multiseed threshold comm
+```
+
+Available groups:
+
+| Group | Description | New Output Files |
+|-------|-------------|------------------|
+| `defense` | FedAvg / Median / Krum / TrimMean under same attack | `defense_comparison.*` |
+| `alpha` | Dirichlet α ∈ {0.1, 0.5, 1.0} sweep | `sensitivity_alpha.*` |
+| `byzantine` | Byzantine % ∈ {10%, 20%, 30%} sweep | `sensitivity_byzantine.*` |
+| `buffer` | Async buffer size ∈ {4, 6, 8} sweep | `sensitivity_buffer.*` |
+| `multiseed` | 3-seed runs with mean ± std | `multiseed_stats.*` |
+| `threshold` | Byzantine fraction ∈ {0%–50%} failure point | `failure_threshold.*` |
+| `comm` | Accuracy vs communication volume | `communication_cost.*`, `rounds_to_target.png` |
 
 ### Run Tests Only
 
@@ -342,17 +403,59 @@ In Flower ≥ 1.8 simulation mode, `client.cid` is a large UUID integer (e.g., `
 
 ---
 
-## 12. Output Plots
+## 12. Output Files
+
+### Core Experiment Plots (from `main.py`)
 
 | File | Content |
 |------|---------|
-| `results/convergence.png` | Accuracy convergence curves — Exp A, B, C, D |
-| `results/loss_curves.png` | Cross-entropy loss per round — Exp A, B, C, D |
-| `results/dp_tradeoff.png` | Accuracy vs round: Exp C (no DP) vs Exp D (DP) |
+| `results/convergence.png` | Accuracy convergence — Exp A, B, C, D |
+| `results/loss_curves.png` | Cross-entropy loss — Exp A, B, C, D |
+| `results/dp_tradeoff.png` | Accuracy: Exp C (no DP) vs Exp D (DP) |
 | `results/attack_impact.png` | Accuracy: clean vs attacked vs defended |
 | `results/dropout_reliability.png` | Async buffer fill rate under unreliable clients |
-| `results/detection_rate.png` | Per-round flagged client IDs (malicious vs noisy) |
-| `results/heterogeneity.png` | Convergence: non-IID (α=0.5) vs near-IID (α=1000) |
+| `results/detection_rate.png` | Per-round flagged client IDs |
+| `results/heterogeneity.png` | non-IID (α=0.5) vs near-IID (α=1000) |
+| `results/participation_rate.png` | Final accuracy vs client participation rate (Exp F) |
+| `results/centralized_vs_fl.png` | Centralised baseline vs AsyncRobustFL overlay |
+
+### Core Structured Metrics (from `main.py`)
+
+| File | Content |
+|------|---------|
+| `results/fl_metrics.csv` | Per-round FL metrics: experiment, round, accuracy, loss, round_time_secs |
+| `results/fl_metrics.json` | Same in JSON format |
+| `results/centralized_accuracy.csv` | Centralised per-epoch metrics |
+
+### Research Experiment Outputs (from `experiments.py`)
+
+| File | Content |
+|------|---------|
+| `results/defense_comparison.png` | All defense methods vs attack (mean ± std) |
+| `results/defense_comparison.csv` | Per-round mean/std per defense method |
+| `results/defense_comparison.json` | Same in JSON |
+| `results/sensitivity_alpha.png` | Accuracy curves for Dirichlet α sweep |
+| `results/sensitivity_alpha.{csv,json}` | Per-round mean ± std per α value |
+| `results/sensitivity_byzantine.png` | Accuracy curves for Byzantine % sweep |
+| `results/sensitivity_byzantine.{csv,json}` | Per-round mean ± std per Byzantine fraction |
+| `results/sensitivity_buffer.png` | Accuracy curves for async buffer size sweep |
+| `results/sensitivity_buffer.{csv,json}` | Per-round mean ± std per buffer size |
+| `results/multiseed_stats.png` | Mean ± std curves for 3-seed runs |
+| `results/multiseed_stats.csv` | Per-round mean/std per experiment (seeds: 42, 123, 999) |
+| `results/multiseed_stats.json` | Same in JSON |
+| `results/failure_threshold.png` | Final accuracy vs Byzantine fraction (failure point marked) |
+| `results/failure_threshold.csv` | Per-fraction final accuracy + failure flag |
+| `results/failure_threshold.json` | Failure point + full sweep data |
+| `results/communication_cost.png` | Accuracy vs comm rounds and vs cumulative MB |
+| `results/rounds_to_target.png` | Rounds to reach 80% accuracy per defense method |
+| `results/communication_cost.csv` | Per-round cumulative MB + accuracy per method |
+| `results/communication_cost.json` | Model size, total bytes, rounds-to-target per method |
+
+### Report
+
+| File | Content |
+|------|---------|
+| `NeuralX_FL_IEEE_Report.docx` | IEEE-style 6-page Word document (run `generate_ieee_report.py`) |
 
 ---
 
@@ -368,4 +471,101 @@ NeuralX-FL demonstrates that a carefully engineered FL system can:
 
 ---
 
-*Built for hackathon. All experiments validated. 29/29 tests passing.*
+---
+
+## 13. Experimental Methodology
+
+All experiments follow a common protocol:
+
+- **Controlled variable design**: Each experiment changes exactly one condition (attack presence, defence, DP, heterogeneity, participation rate) relative to a fixed baseline configuration.
+- **Reproducibility**: SEED=42 is set for `random`, `numpy`, `torch` at the start of every experiment and simulation call. Dirichlet partitioning uses seed=42 (train) and seed=43 (test).
+- **Evaluation**: A shared global test set (7,180 PathMNIST images) is evaluated after every round via the Flower `evaluate()` callback — no leakage from local test sets.
+- **Centralised baseline**: `centralized.py` trains PathologyNet on the full 89,996-image train set (no federation, no privacy) to establish a theoretical accuracy upper bound.
+- **Participation rate sweep (Exp F)**: `clients_per_round` is varied over 5 values (20%, 40%, 60%, 80%, 100% of 10 clients) while holding all other parameters fixed, to characterise the accuracy-communication trade-off.
+
+### Metrics logged per round
+
+| Metric | Source |
+|--------|--------|
+| Global test accuracy | `EvaluateFn.evaluate()` callback |
+| Global test loss | `EvaluateFn.evaluate()` callback |
+| Wall-clock time per round | `time.perf_counter()` delta in `EvaluateFn` |
+| Flagged clients (Byzantine / noisy) | Returned by `strategy.aggregate_fit()` |
+| Buffer dropout count | Returned by `strategy.aggregate_fit()` |
+
+---
+
+## 14. Reproducibility
+
+### Steps to reproduce all results
+
+```powershell
+# 1. Clone and enter the project
+git clone <repository-url>
+cd async_robust_fl
+
+# 2. Create and activate virtual environment
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# 3. Install CUDA PyTorch (must be first)
+pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+
+# 4. Install remaining dependencies
+pip install -r requirements.txt
+
+# 5. IMPORTANT: Ensure simulation mode is active
+# In config.py, confirm: USE_REAL_NETWORK = False
+
+# 6. Run core experiments (~6 hours on GTX 1650)
+python main.py
+
+# 7. Run research experiments (all groups, ~12-18 hours for 3 seeds)
+python experiments.py
+# Or run a single group:
+python experiments.py --group defense
+
+# 8. Generate IEEE Word report
+python generate_ieee_report.py
+```
+
+### Expected outputs after full run
+
+```
+results/
+  convergence.png, loss_curves.png, dp_tradeoff.png,
+  attack_impact.png, dropout_reliability.png, detection_rate.png,
+  heterogeneity.png, participation_rate.png, centralized_vs_fl.png,
+  fl_metrics.csv, fl_metrics.json, centralized_accuracy.csv
+
+NeuralX_FL_IEEE_Report.docx
+```
+
+### Critical configuration note
+
+`config.py` contains `USE_REAL_NETWORK: bool`. This must be `False` for simulation runs:
+
+```python
+# config.py
+USE_REAL_NETWORK: bool = False   # ← required for main.py / centralized.py
+```
+
+Set to `True` only for real Tailscale multi-machine deployment (port 9092).
+
+---
+
+## 15. Limitations
+
+| Limitation | Details | Workaround / Fix |
+|------------|---------|------------------|
+| Trimmed mean trims zero elements | `floor(0.1 × 4) = 0` — no trimming at buffer size 4 | Set `TRIM_FRACTION=0.25` or `ASYNC_BUFFER_SIZE≥8` |
+| Krum invalid at n=4, f=1 | Krum requires `n > 2f+2 = 4`; not met at current buffer | Only use trimmed_mean/fedavg aggregation at BUFFER=4 |
+| DP noise scale is small | `σ=0.1, C=0.1` gives effective noise=1.0; standard DP-FL uses `σ≥1.0` | Increase σ for stronger formal privacy |
+| GPU-only model | PathologyNet raises `RuntimeError` if no CUDA device | Add CPU fallback path in `model.py` |
+| 20-round limit | Full convergence may need ≥50 rounds on complex partitions | Increase `NUM_ROUNDS` in config.py |
+| Centralised baseline has no privacy | Accesses full dataset — establishes ceiling only, not deployable | Use as reference, not production component |
+| Research experiments runtime | 3 seeds × 7 groups ≈ 60+ FL simulation runs (~12–18 hours) | Run `--group` flag to execute one group at a time |
+
+---
+
+*Research project. All experiments validated. 29/29 tests passing. IEEE report: run `python generate_ieee_report.py`.*

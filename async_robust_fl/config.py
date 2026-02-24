@@ -26,6 +26,15 @@ ASYNC_BUFFER_SIZE: int = 4     # Aggregate once this many clean updates arrive;
 NUM_ROUNDS: int = 20
 LOCAL_EPOCHS_WARMUP: int = 2   # Rounds 1-3  — short local training while model
 LOCAL_EPOCHS_MAIN: int = 5     # Rounds 4+   — longer once model has a base
+LEARNING_RATE: float = 1e-3    # Adam optimiser learning rate (all clients + centralised)
+
+# Centralised baseline: equivalent training budget to FL
+# 20 rounds × 5 local epochs ≈ 100 total epochs when run centrally.
+CENTRALIZED_EPOCHS: int = 100  # Full-data epochs for the centralised baseline run
+
+# Participation rate sweep (Experiment F) — values expressed as fractions of NUM_CLIENTS.
+# E.g. 0.2 means 2 out of 10 clients participate each round.
+PARTICIPATION_RATES: tuple = (0.2, 0.4, 0.6, 0.8, 1.0)
 
 # ---------------------------------------------------------------------------
 # Data — PathMNIST
@@ -88,7 +97,7 @@ GROUP_COSINE_THRESHOLD: float   = 0.5
 # Set USE_REAL_NETWORK = False → standard Ray simulation (default).
 # Everything else (strategy, detection, trust scoring) is identical.
 
-USE_REAL_NETWORK: bool = True
+USE_REAL_NETWORK: bool = False
 
 # Your PC listens on this address (server side)
 SERVER_BIND: str = "0.0.0.0:9092"

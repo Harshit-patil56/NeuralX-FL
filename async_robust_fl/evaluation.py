@@ -11,12 +11,17 @@ References to mandatory features:
   Mandatory #5 (Evaluation) → plot_convergence, plot_attack_impact,
                                plot_dropout_reliability, plot_detection
   Mandatory #3 (Detection)  → plot_detection, compute_attack_metrics
+  Research extension        → export_metrics_csv, export_metrics_json,
+                               plot_participation_rate, plot_centralized_vs_fl
 """
 
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import os
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -69,6 +74,8 @@ class EvaluateFn:
         self._testloader      = global_testloader
         self.accuracy_history: List[float] = []
         self.loss_history:     List[float] = []
+        self.round_times:      List[float] = []   # wall-clock seconds per round
+        self._round_start:     float       = time.perf_counter()
 
     def __call__(
         self,
@@ -76,14 +83,18 @@ class EvaluateFn:
         parameters:   List[np.ndarray],
         config:       Dict,
     ) -> Tuple[float, Dict]:
+        round_time = time.perf_counter() - self._round_start
+        self._round_start = time.perf_counter()   # reset for next round
+
         net = PathologyNet()
         set_weights(net, parameters)
         accuracy, loss = evaluate_model(net, self._testloader)
         self.accuracy_history.append(accuracy)
         self.loss_history.append(loss)
+        self.round_times.append(round_time)
         logger.info(
-            "[Round %02d]  PathMNIST Accuracy: %.4f  |  Loss: %.4f",
-            server_round, accuracy, loss,
+            "[Round %02d]  PathMNIST Accuracy: %.4f  |  Loss: %.4f  |  Round time: %.1fs",
+            server_round, accuracy, loss, round_time,
         )
         return float(loss), {"accuracy": float(accuracy), "round": server_round}
 
@@ -515,3 +526,231 @@ def print_summary(
         f"{'=' * 55}",
     ]
     logger.info("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Metrics export — CSV
+# ---------------------------------------------------------------------------
+
+def export_metrics_csv(
+    experiment_results: Dict[str, Dict],
+    filename: str = "fl_metrics.csv",
+) -> str:
+    """Export per-round FL metrics for all experiments to a single CSV file.
+
+    Each row represents one communication round of one experiment.
+
+    Args:
+        experiment_results: Mapping of experiment label to a dict with keys:
+            ``accuracy`` (List[float]), ``loss`` (List[float]),
+            ``round_times`` (List[float]), ``participation_rate`` (float).
+        filename: Output filename inside RESULTS_DIR.
+
+    Returns:
+        Absolute path of the written CSV file.
+
+    Example CSV columns:
+        experiment, round, accuracy, loss, round_time_secs, participation_rate
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, filename)
+
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "experiment",
+            "round",
+            "accuracy",
+            "loss",
+            "round_time_secs",
+            "participation_rate",
+        ])
+        for label, data in experiment_results.items():
+            acc_list   = data.get("accuracy", [])
+            loss_list  = data.get("loss", [])
+            time_list  = data.get("round_times", [None] * len(acc_list))
+            part_rate  = data.get("participation_rate", float("nan"))
+            for rnd, (acc, loss, t) in enumerate(
+                zip(acc_list, loss_list, time_list), start=1
+            ):
+                writer.writerow([
+                    label,
+                    rnd,
+                    f"{acc:.6f}",
+                    f"{loss:.6f}",
+                    f"{t:.3f}" if t is not None else "",
+                    f"{part_rate:.4f}",
+                ])
+
+    logger.info("FL metrics CSV saved: %s", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Metrics export — JSON
+# ---------------------------------------------------------------------------
+
+def export_metrics_json(
+    experiment_results: Dict[str, Dict],
+    filename: str = "fl_metrics.json",
+) -> str:
+    """Export per-round FL metrics for all experiments to a JSON file.
+
+    Provides a machine-readable structured format suitable for automated
+    analysis pipelines.
+
+    Args:
+        experiment_results: Same structure as ``export_metrics_csv``.
+        filename: Output filename inside RESULTS_DIR.
+
+    Returns:
+        Absolute path of the written JSON file.
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, filename)
+
+    serialisable: Dict = {}
+    for label, data in experiment_results.items():
+        acc_list  = data.get("accuracy",         [])
+        loss_list = data.get("loss",             [])
+        time_list = data.get("round_times",      [None] * len(acc_list))
+        part_rate = data.get("participation_rate", None)
+
+        serialisable[label] = {
+            "participation_rate": part_rate,
+            "rounds": [
+                {
+                    "round":          rnd,
+                    "accuracy":       round(acc, 6),
+                    "loss":           round(loss, 6),
+                    "round_time_secs": round(t, 3) if t is not None else None,
+                }
+                for rnd, (acc, loss, t) in enumerate(
+                    zip(acc_list, loss_list, time_list), start=1
+                )
+            ],
+        }
+
+    with open(path, "w") as fh:
+        json.dump(serialisable, fh, indent=2)
+
+    logger.info("FL metrics JSON saved: %s", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Plot 7 — Accuracy vs client participation rate (Experiment F)
+# ---------------------------------------------------------------------------
+
+def plot_participation_rate(
+    participation_rates: List[float],
+    final_accuracies:    List[float],
+    save_path: str = "participation_rate.png",
+) -> plt.Figure:
+    """Bar chart of final-round accuracy vs client participation rate.
+
+    Isolates participation as the single controlled variable — all other
+    settings (method, attack, detection) are held constant.
+
+    Args:
+        participation_rates: Fraction of NUM_CLIENTS used per round,
+                             e.g. [0.2, 0.4, 0.6, 0.8, 1.0].
+        final_accuracies:    Final-round global accuracy for each rate.
+        save_path:           Filename inside RESULTS_DIR.
+    """
+    rate_labels = [f"{int(r * 100)}%" for r in participation_rates]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars = ax.bar(
+        rate_labels,
+        final_accuracies,
+        color="steelblue",
+        alpha=0.85,
+        edgecolor="white",
+        linewidth=0.8,
+    )
+
+    # Annotate each bar with its exact accuracy value.
+    for bar, acc in zip(bars, final_accuracies):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.005,
+            f"{acc:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+    ax.set_xlabel("Client Participation Rate (clients_per_round / total_clients)", fontsize=11)
+    ax.set_ylabel("Final Global Accuracy (PathMNIST)", fontsize=11)
+    ax.set_title(
+        "Accuracy vs Client Participation Rate\n"
+        "(Exp F — AsyncRobust, 20 rounds, non-IID α=0.5)",
+        fontsize=12,
+    )
+    ax.set_ylim(0, min(1.0, max(final_accuracies) + 0.08))
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save(fig, save_path)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Plot 8 — Centralised baseline vs FL overlay
+# ---------------------------------------------------------------------------
+
+def plot_centralized_vs_fl(
+    centralized_accuracy: List[float],
+    fl_accuracy:          List[float],
+    fl_label:             str = "Exp C: AsyncRobust (FL)",
+    save_path:            str = "centralized_vs_fl.png",
+) -> plt.Figure:
+    """Overlay centralised accuracy (per epoch) with FL accuracy (per round).
+
+    The x-axis represents training steps in equivalent units so the
+    convergence rates are directly comparable.
+
+    Args:
+        centralized_accuracy: Per-epoch test accuracy from ``centralized.py``.
+        fl_accuracy:          Per-round test accuracy from an FL experiment.
+        fl_label:             Legend label for the FL curve.
+        save_path:            Filename inside RESULTS_DIR.
+    """
+    # Down-sample centralised curve to the same number of points as FL
+    # so both curves share the same x-axis scale (communication rounds).
+    n_fl = len(fl_accuracy)
+    n_cen = len(centralized_accuracy)
+
+    if n_cen >= n_fl:
+        # Sample n_fl evenly-spaced epochs from the centralised history
+        indices_cen = [int(round(i * (n_cen - 1) / (n_fl - 1))) for i in range(n_fl)]
+        cen_sampled = [centralized_accuracy[i] for i in indices_cen]
+    else:
+        cen_sampled = centralized_accuracy
+
+    x_axis = list(range(1, len(cen_sampled) + 1))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(
+        x_axis, cen_sampled,
+        "-D", label="Centralised (full data, no privacy)",
+        linewidth=2, color="darkorange", markersize=4,
+    )
+    ax.plot(
+        list(range(1, n_fl + 1)), fl_accuracy,
+        "-o", label=fl_label,
+        linewidth=2, color="green", markersize=4,
+    )
+
+    ax.set_xlabel("Communication Round (FL) / Equivalent Epoch (Centralised)", fontsize=11)
+    ax.set_ylabel("Global Accuracy (PathMNIST)", fontsize=11)
+    ax.set_title(
+        "Centralised Baseline vs Federated Learning\n"
+        "(PathMNIST, 10 Hospitals, Non-IID α=0.5)",
+        fontsize=12,
+    )
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _save(fig, save_path)
+    return fig

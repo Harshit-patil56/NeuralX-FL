@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 
+from config import LEARNING_RATE
+
 # ---------------------------------------------------------------------------
 # Device — GPU only; raises immediately if no CUDA-capable device is found
 # ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ def train(
     net.to(device)
     net.train()
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(net.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
 
     for _ in range(epochs):
@@ -132,14 +134,22 @@ def evaluate_model(
 ) -> tuple[float, float]:
     """Evaluate `net` and return (accuracy, avg_loss).
 
+    Uses ``reduction='sum'`` on the criterion so ``loss_sum`` is the exact
+    total unnormalised loss across all samples.  Dividing by ``total`` at the
+    end gives a true per-sample mean that is unbiased for batches of any size,
+    including the final short batch.
+
     Supports dict and tuple batch formats.
     """
     device = device or DEVICE
     net.to(device)
     net.eval()
 
-    criterion = nn.CrossEntropyLoss()
-    correct, total, loss_sum = 0, 0, 0.0
+    # reduction='sum' → each call returns the summed (not mean) loss for the
+    # batch.  We accumulate directly and divide once at the end.
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+    correct, total = 0, 0
+    loss_sum = 0.0
 
     with torch.no_grad():
         for batch in testloader:
@@ -152,13 +162,11 @@ def evaluate_model(
             labels = labels.to(device)
 
             outputs = net(images)
-            # Accumulate sum of per-sample losses (batch_size-weighted) so
-            # the final average is unbiased for unequal-sized last batches.
-            loss_sum += criterion(outputs, labels).item() * labels.size(0)
+            loss_sum += criterion(outputs, labels).item()   # batch sum
             _, predicted = torch.max(outputs, dim=1)
             total   += labels.size(0)
             correct += (predicted == labels).sum().item()
 
     accuracy = correct / total if total > 0 else 0.0
-    avg_loss = loss_sum / max(total, 1)   # true per-sample mean loss
+    avg_loss = loss_sum / max(total, 1)   # true per-sample mean
     return accuracy, avg_loss
